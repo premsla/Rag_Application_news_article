@@ -1,0 +1,173 @@
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+// Initialize Google Gemini for text generation
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+
+// Simple text processing utilities
+function tokenize(text) {
+  if (!text) return [];
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ') // Remove punctuation
+    .split(/\s+/)
+    .filter(word => word.length > 2); // Remove short tokens
+}
+
+function getWordFreq(tokens) {
+  return tokens.reduce((freq, word) => {
+    freq[word] = (freq[word] || 0) + 1;
+    return freq;
+  }, {});
+}
+
+function cosineSimilarity(vecA, vecB) {
+  const words = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (const word of words) {
+    const a = vecA[word] || 0;
+    const b = vecB[word] || 0;
+    dotProduct += a * b;
+    normA += a * a;
+    normB += b * b;
+  }
+
+  return normA === 0 || normB === 0 ? 0 : dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+class RAGPipeline {
+  constructor() {
+    this.documents = [];
+    this.documentVectors = [];
+    this.initialized = false;
+  }
+
+  async initialize() {
+    if (this.initialized) return true;
+    console.log('Initializing RAG pipeline...');
+    this.initialized = true;
+    return true;
+  }
+
+  async addDocuments(documents) {
+    await this.initialize();
+    
+    for (const doc of documents) {
+      // Ensure document has required fields
+      if (!doc.text || !doc.title) {
+        console.warn('Skipping document missing required fields:', doc);
+        continue;
+      }
+      
+      // Store document with metadata
+      const document = {
+        text: doc.text,
+        metadata: {
+          title: doc.title,
+          url: doc.url || '',
+          publishedAt: doc.publishedAt || new Date().toISOString(),
+          source: doc.source || 'unknown'
+        }
+      };
+      
+      // Create vector representation
+      const tokens = tokenize(document.text);
+      const vector = getWordFreq(tokens);
+      
+      // Store document and its vector
+      this.documents.push(document);
+      this.documentVectors.push(vector);
+    }
+    
+    console.log(`Added ${documents.length} documents to the pipeline`);
+    return true;
+  }
+
+  async query(queryText, k = 3) {
+    if (!this.initialized) await this.initialize();
+    
+    try {
+      console.log('Processing query:', queryText);
+      
+      if (this.documents.length === 0) {
+        console.warn('No documents in the pipeline');
+        return {
+          answer: "I don't have any articles to search through yet.",
+          sources: []
+        };
+      }
+      
+      // Process query
+      const queryTokens = tokenize(queryText);
+      if (queryTokens.length === 0) {
+        return {
+          answer: "I couldn't understand your query. Could you please rephrase it?",
+          sources: []
+        };
+      }
+      
+      const queryVector = getWordFreq(queryTokens);
+      
+      // Calculate similarity scores
+      const scores = this.documentVectors.map((docVector, idx) => ({
+        index: idx,
+        score: cosineSimilarity(queryVector, docVector)
+      }));
+      
+      // Get top k results
+      const topK = scores
+        .sort((a, b) => b.score - a.score)
+        .slice(0, k)
+        .filter(item => item.score > 0);
+      
+      if (topK.length === 0) {
+        return {
+          answer: "I couldn't find any relevant information to answer your question.",
+          sources: []
+        };
+      }
+      
+      // Format context for the LLM
+      const context = topK.map((item, i) => {
+        const doc = this.documents[item.index];
+        return (
+          `Source ${i + 1}: ${doc.metadata.title}\n` +
+          `Content: ${doc.text.substring(0, 200)}...`
+        );
+      }).join('\n\n');
+      
+      // Generate response using Gemini
+      const prompt = [
+        'You are a helpful news assistant. Answer the question based on the provided news articles.',
+        'If the answer cannot be found in the articles, say "I don\'t have enough information to answer that."',
+        'Use the following articles as context:',
+        context,
+        `\nQuestion: ${queryText}\nAnswer:`
+      ].join('\n\n');
+      
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+      
+      return {
+        answer: text,
+        sources: topK.map(item => ({
+          content: this.documents[item.index].text,
+          metadata: this.documents[item.index].metadata
+        }))
+      };
+      
+    } catch (error) {
+      console.error('Error in RAG query:', error);
+      return {
+        answer: "I'm sorry, I encountered an error while processing your request.",
+        sources: []
+      };
+    }
+  }
+}
+
+module.exports = new RAGPipeline();
